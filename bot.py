@@ -1,3 +1,4 @@
+python
 import os
 import time
 import logging
@@ -29,4 +30,157 @@ PRICE_ALERT_TARGET = os.environ.get("PRICE_ALERT_TARGET")
 PRICE_ALERT_TARGET = float(PRICE_ALERT_TARGET) if PRICE_ALERT_TARGET else None
 
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
-DEXSCREE
+DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
+
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+# --- State (in-memory; resets if the bot restarts) ---
+state = {
+    "last_alert_direction": None,  # "up" or "down" or None
+    "last_alert_pct": None,
+    "price_target_alerted": False,  # whether we've already alerted for PRICE_ALERT_TARGET
+}
+
+
+def send_telegram(text: str):
+    try:
+        resp = requests.post(
+            TELEGRAM_API,
+            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            log.error("Telegram send failed: %s %s", resp.status_code, resp.text)
+    except Exception as e:
+        log.error("Telegram send exception: %s", e)
+
+
+def fetch_pair():
+    """Fetch the best-liquidity XST/USDC-ish pair from DexScreener."""
+    try:
+        if TOKEN_ADDRESS:
+            r = requests.get(DEXSCREENER_TOKEN_URL.format(address=TOKEN_ADDRESS), timeout=15)
+        else:
+            r = requests.get(DEXSCREENER_SEARCH_URL, params={"q": SEARCH_QUERY}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        pairs = data.get("pairs") or []
+        if not pairs:
+            log.warning("No pairs returned from DexScreener")
+            return None
+
+        candidates = [
+            p for p in pairs
+            if p.get("chainId") == "solana"
+            and p.get("baseToken", {}).get("symbol", "").upper() == "XST"
+            and (p.get("liquidity", {}) or {}).get("usd", 0) >= MIN_LIQUIDITY_USD
+        ]
+        if not candidates:
+            candidates = [p for p in pairs if p.get("baseToken", {}).get("symbol", "").upper() == "XST"]
+        if not candidates:
+            log.warning("No matching XST pairs found")
+            return None
+
+        best = max(candidates, key=lambda p: (p.get("liquidity", {}) or {}).get("usd", 0))
+        return best
+    except Exception as e:
+        log.error("Fetch error: %s", e)
+        return None
+
+
+def check_once():
+    pair = fetch_pair()
+    if not pair:
+        return
+
+    price = float(pair.get("priceUsd", 0) or 0)
+    price_change = pair.get("priceChange", {}) or {}
+    change_24h_pct = float(price_change.get("h24", 0) or 0)
+    pair_url = pair.get("url", "")
+    pair_name = f"{pair.get('baseToken', {}).get('symbol')}/{pair.get('quoteToken', {}).get('symbol')}"
+
+    now = datetime.now(timezone.utc)
+
+    if "session_high" not in state or state.get("session_reset_date") != now.date():
+        state["session_high"] = price
+        state["session_low"] = price
+        state["session_reset_date"] = now.date()
+        log.info("Session high/low reset for new day: %.6f", price)
+
+    if price > state["session_high"]:
+        state["session_high"] = price
+    if price < state["session_low"]:
+        state["session_low"] = price
+
+    session_high = state["session_high"]
+    session_low = state["session_low"]
+
+    drop_from_high_pct = (session_high - price) / session_high * 100 if session_high else 0
+    rise_from_low_pct = (price - session_low) / session_low * 100 if session_low else 0
+
+    log.info(
+        "%s price=$%.6f | 24h%%=%.2f%% | drop_from_high=%.2f%% | rise_from_low=%.2f%%",
+        pair_name, price, change_24h_pct, drop_from_high_pct, rise_from_low_pct,
+    )
+
+    # --- Alert on fixed price target crossed upward ---
+    if PRICE_ALERT_TARGET is not None:
+        if price >= PRICE_ALERT_TARGET and not state["price_target_alerted"]:
+            send_telegram(
+                f"🎯 KAINOS RIBA PASIEKTA\n\n"
+                f"<b>{pair_name}</b>\n"
+                f"Kaina: ${price:.6f}\n"
+                f"Pasiekė/viršijo tikslą ${PRICE_ALERT_TARGET:.6f}\n\n"
+                f"{pair_url}"
+            )
+            state["price_target_alerted"] = True
+        elif price < PRICE_ALERT_TARGET and state["price_target_alerted"]:
+            state["price_target_alerted"] = False
+
+    # --- Alert on drop from session high ---
+    if drop_from_high_pct >= ALERT_THRESHOLD_LOW:
+        if state["last_alert_direction"] != "down" or (
+            drop_from_high_pct - (state["last_alert_pct"] or 0) >= 5
+        ):
+            severity = "🔴🔴 STIPRUS KRITIMAS" if drop_from_high_pct >= ALERT_THRESHOLD_HIGH else "🔴 KRITIMAS"
+            send_telegram(
+                f"{severity}\n\n"
+                f"<b>{pair_name}</b>\n"
+                f"Kaina: ${price:.6f}\n"
+                f"Krito {drop_from_high_pct:.1f}% nuo dienos aukščio (${session_high:.6f})\n\n"
+                f"{pair_url}"
+            )
+            state["last_alert_direction"] = "down"
+            state["last_alert_pct"] = drop_from_high_pct
+
+    # --- Alert on rise from session low ---
+    elif rise_from_low_pct >= ALERT_THRESHOLD_LOW:
+        if state["last_alert_direction"] != "up" or (
+            rise_from_low_pct - (state["last_alert_pct"] or 0) >= 5
+        ):
+            severity = "🟢🟢 STIPRUS KILIMAS" if rise_from_low_pct >= ALERT_THRESHOLD_HIGH else "🟢 KILIMAS"
+            send_telegram(
+                f"{severity}\n\n"
+                f"<b>{pair_name}</b>\n"
+                f"Kaina: ${price:.6f}\n"
+                f"Kilo {rise_from_low_pct:.1f}% nuo dienos žemumo (${session_low:.6f})\n\n"
+                f"{pair_url}"
+            )
+            state["last_alert_direction"] = "up"
+            state["last_alert_pct"] = rise_from_low_pct
+
+
+def main():
+    log.info("XST alert bot starting. Interval=%ss, thresholds=%s-%s%%",
+              CHECK_INTERVAL_SECONDS, ALERT_THRESHOLD_LOW, ALERT_THRESHOLD_HIGH)
+    send_telegram("✅ XST kainos stebėjimo botas paleistas.")
+    while True:
+        try:
+            check_once()
+        except Exception as e:
+            log.error("Loop error: %s", e)
+        time.sleep(CHECK_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
