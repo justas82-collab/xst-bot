@@ -146,8 +146,8 @@ def check_once():
     rise_from_low_pct = (price - session_low) / session_low * 100 if session_low else 0
 
     log.info(
-        "%s price=$%.6f | 24h%%=%.2f%% | drop_from_high=%.2f%% | rise_from_low=%.2f%%",
-        pair_name, price, change_24h_pct, drop_from_high_pct, rise_from_low_pct,
+        "%s price=$%.6f | 1h%%=%.2f%% | 6h%%=%.2f%% | 24h%%=%.2f%% | drop_from_high=%.2f%% | rise_from_low=%.2f%%",
+        pair_name, price, change_1h_pct, change_6h_pct, change_24h_pct, drop_from_high_pct, rise_from_low_pct,
     )
 
     # --- Alert on fixed price target crossed upward ---
@@ -165,7 +165,7 @@ def check_once():
             # Price dropped back below target; re-arm so a future cross alerts again
             state["price_target_alerted"] = False
 
-    # --- Restart-proof alert based on DexScreener's own h6 change ---
+    # --- Restart-proof alert based on DexScreener's own h6/h24 change ---
     # This doesn't depend on the bot's own uptime/memory, so it still works
     # even if the process restarts (unlike the session high/low tracking below).
     now_ts = now.timestamp()
@@ -173,17 +173,24 @@ def check_once():
         state["market_alert_time"] is None
         or (now_ts - state["market_alert_time"]) >= ALERT_COOLDOWN_MINUTES * 60
     )
-    if abs(change_6h_pct) >= ALERT_THRESHOLD_LOW and cooldown_ok:
-        direction = "down" if change_6h_pct < 0 else "up"
-        is_strong = abs(change_6h_pct) >= ALERT_THRESHOLD_HIGH
+    # Use whichever window (6h or 24h) shows the bigger absolute move
+    if abs(change_24h_pct) >= abs(change_6h_pct):
+        trigger_pct, trigger_window = change_24h_pct, "24h"
+    else:
+        trigger_pct, trigger_window = change_6h_pct, "6h"
+
+    if abs(trigger_pct) >= ALERT_THRESHOLD_LOW and cooldown_ok:
+        direction = "down" if trigger_pct < 0 else "up"
+        is_strong = abs(trigger_pct) >= ALERT_THRESHOLD_HIGH
         if direction == "down":
-            severity = "🔴🔴 STIPRUS KRITIMAS (6h)" if is_strong else "🔴 KRITIMAS (6h)"
+            severity = f"🔴🔴 STIPRUS KRITIMAS ({trigger_window})" if is_strong else f"🔴 KRITIMAS ({trigger_window})"
         else:
-            severity = "🟢🟢 STIPRUS KILIMAS (6h)" if is_strong else "🟢 KILIMAS (6h)"
+            severity = f"🟢🟢 STIPRUS KILIMAS ({trigger_window})" if is_strong else f"🟢 KILIMAS ({trigger_window})"
         send_telegram(
             f"{severity}\n\n"
             f"<b>{pair_name}</b>\n"
             f"Kaina: ${price:.6f}\n"
+            f"Pokytis per 1h: {change_1h_pct:+.1f}%\n"
             f"Pokytis per 6h: {change_6h_pct:+.1f}%\n"
             f"Pokytis per 24h: {change_24h_pct:+.1f}%\n\n"
             f"{pair_url}"
