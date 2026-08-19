@@ -19,7 +19,7 @@ TOKEN_ADDRESS = os.environ.get("XST_TOKEN_ADDRESS", "")
 # Fallback: search by symbol+name if no address given
 SEARCH_QUERY = os.environ.get("XST_SEARCH_QUERY", "XST Xsolu")
 
-CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "120"))  # 2 min
+CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "300"))  # 5 min (DexScreener rate-limits frequent calls)
 ALERT_THRESHOLD_LOW = float(os.environ.get("ALERT_THRESHOLD_LOW", "10"))   # %
 ALERT_THRESHOLD_HIGH = float(os.environ.get("ALERT_THRESHOLD_HIGH", "15"))  # %
 MIN_LIQUIDITY_USD = float(os.environ.get("MIN_LIQUIDITY_USD", "10000"))
@@ -58,13 +58,31 @@ def send_telegram(text: str):
         log.error("Telegram send exception: %s", e)
 
 
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; XST-alert-bot/1.0)",
+    "Accept": "application/json",
+}
+
+
 def fetch_pair():
     """Fetch the best-liquidity XST/USDC-ish pair from DexScreener."""
     try:
         if TOKEN_ADDRESS:
-            r = requests.get(DEXSCREENER_TOKEN_URL.format(address=TOKEN_ADDRESS), timeout=15)
+            r = requests.get(
+                DEXSCREENER_TOKEN_URL.format(address=TOKEN_ADDRESS),
+                headers=HTTP_HEADERS,
+                timeout=15,
+            )
         else:
-            r = requests.get(DEXSCREENER_SEARCH_URL, params={"q": SEARCH_QUERY}, timeout=15)
+            r = requests.get(
+                DEXSCREENER_SEARCH_URL,
+                params={"q": SEARCH_QUERY},
+                headers=HTTP_HEADERS,
+                timeout=15,
+            )
+        if r.status_code == 429:
+            log.warning("Rate limited (429) by DexScreener. Will retry next cycle.")
+            return None
         r.raise_for_status()
         data = r.json()
         pairs = data.get("pairs") or []
@@ -195,3 +213,28 @@ def check_once():
             rise_from_low_pct - (state["last_alert_pct"] or 0) >= 5
         ):
             severity = "🟢🟢 STIPRUS KILIMAS" if rise_from_low_pct >= ALERT_THRESHOLD_HIGH else "🟢 KILIMAS"
+            send_telegram(
+                f"{severity}\n\n"
+                f"<b>{pair_name}</b>\n"
+                f"Kaina: ${price:.6f}\n"
+                f"Kilo {rise_from_low_pct:.1f}% nuo dienos žemumo (${session_low:.6f})\n\n"
+                f"{pair_url}"
+            )
+            state["last_alert_direction"] = "up"
+            state["last_alert_pct"] = rise_from_low_pct
+
+
+def main():
+    log.info("XST alert bot starting. Interval=%ss, thresholds=%s-%s%%",
+              CHECK_INTERVAL_SECONDS, ALERT_THRESHOLD_LOW, ALERT_THRESHOLD_HIGH)
+    send_telegram("✅ XST kainos stebėjimo botas paleistas.")
+    while True:
+        try:
+            check_once()
+        except Exception as e:
+            log.error("Loop error: %s", e)
+        time.sleep(CHECK_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
