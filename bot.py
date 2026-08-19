@@ -1,4 +1,3 @@
-
 import os
 import time
 import logging
@@ -39,7 +38,11 @@ state = {
     "last_alert_direction": None,  # "up" or "down" or None
     "last_alert_pct": None,
     "price_target_alerted": False,  # whether we've already alerted for PRICE_ALERT_TARGET
+    "market_alert_direction": None,  # "up" or "down" or None, for the restart-proof h6/h24 alert
+    "market_alert_time": None,
 }
+
+ALERT_COOLDOWN_MINUTES = int(os.environ.get("ALERT_COOLDOWN_MINUTES", "60"))
 
 
 def send_telegram(text: str):
@@ -69,6 +72,7 @@ def fetch_pair():
             log.warning("No pairs returned from DexScreener")
             return None
 
+        # Filter to Solana XST pairs with decent liquidity, pick highest liquidity
         candidates = [
             p for p in pairs
             if p.get("chainId") == "solana"
@@ -95,10 +99,15 @@ def check_once():
 
     price = float(pair.get("priceUsd", 0) or 0)
     price_change = pair.get("priceChange", {}) or {}
-    change_24h_pct = float(price_change.get("h24", 0) or 0)
+    change_1h_pct = float(price_change.get("h1", 0) or 0)
+    change_6h_pct = float(price_change.get("h6", 0) or 0)
+    change_24h_pct = float(price_change.get("h24", 0) or 0)  # % change vs 24h ago (not high/low)
     pair_url = pair.get("url", "")
     pair_name = f"{pair.get('baseToken', {}).get('symbol')}/{pair.get('quoteToken', {}).get('symbol')}"
 
+    # DexScreener doesn't give 24h high/low directly in this endpoint,
+    # so we approximate: derive high/low from current price and % change,
+    # then track our own rolling high/low across checks for accuracy.
     now = datetime.now(timezone.utc)
 
     if "session_high" not in state or state.get("session_reset_date") != now.date():
@@ -135,7 +144,34 @@ def check_once():
             )
             state["price_target_alerted"] = True
         elif price < PRICE_ALERT_TARGET and state["price_target_alerted"]:
+            # Price dropped back below target; re-arm so a future cross alerts again
             state["price_target_alerted"] = False
+
+    # --- Restart-proof alert based on DexScreener's own h6 change ---
+    # This doesn't depend on the bot's own uptime/memory, so it still works
+    # even if the process restarts (unlike the session high/low tracking below).
+    now_ts = now.timestamp()
+    cooldown_ok = (
+        state["market_alert_time"] is None
+        or (now_ts - state["market_alert_time"]) >= ALERT_COOLDOWN_MINUTES * 60
+    )
+    if abs(change_6h_pct) >= ALERT_THRESHOLD_LOW and cooldown_ok:
+        direction = "down" if change_6h_pct < 0 else "up"
+        is_strong = abs(change_6h_pct) >= ALERT_THRESHOLD_HIGH
+        if direction == "down":
+            severity = "🔴🔴 STIPRUS KRITIMAS (6h)" if is_strong else "🔴 KRITIMAS (6h)"
+        else:
+            severity = "🟢🟢 STIPRUS KILIMAS (6h)" if is_strong else "🟢 KILIMAS (6h)"
+        send_telegram(
+            f"{severity}\n\n"
+            f"<b>{pair_name}</b>\n"
+            f"Kaina: ${price:.6f}\n"
+            f"Pokytis per 6h: {change_6h_pct:+.1f}%\n"
+            f"Pokytis per 24h: {change_24h_pct:+.1f}%\n\n"
+            f"{pair_url}"
+        )
+        state["market_alert_direction"] = direction
+        state["market_alert_time"] = now_ts
 
     # --- Alert on drop from session high ---
     if drop_from_high_pct >= ALERT_THRESHOLD_LOW:
@@ -159,28 +195,3 @@ def check_once():
             rise_from_low_pct - (state["last_alert_pct"] or 0) >= 5
         ):
             severity = "🟢🟢 STIPRUS KILIMAS" if rise_from_low_pct >= ALERT_THRESHOLD_HIGH else "🟢 KILIMAS"
-            send_telegram(
-                f"{severity}\n\n"
-                f"<b>{pair_name}</b>\n"
-                f"Kaina: ${price:.6f}\n"
-                f"Kilo {rise_from_low_pct:.1f}% nuo dienos žemumo (${session_low:.6f})\n\n"
-                f"{pair_url}"
-            )
-            state["last_alert_direction"] = "up"
-            state["last_alert_pct"] = rise_from_low_pct
-
-
-def main():
-    log.info("XST alert bot starting. Interval=%ss, thresholds=%s-%s%%",
-              CHECK_INTERVAL_SECONDS, ALERT_THRESHOLD_LOW, ALERT_THRESHOLD_HIGH)
-    send_telegram("✅ XST kainos stebėjimo botas paleistas.")
-    while True:
-        try:
-            check_once()
-        except Exception as e:
-            log.error("Loop error: %s", e)
-        time.sleep(CHECK_INTERVAL_SECONDS)
-
-
-if __name__ == "__main__":
-    main()
